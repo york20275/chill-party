@@ -1,22 +1,63 @@
-(() => {
+(async () => {
   'use strict';
   const DATA = window.CHILL_PARTY_DATA;
   const app = document.getElementById('app');
 
   const YT = {
-    sdk: window.ytgame || window.youtube?.playables || null,
-    firstFrameReady(){ try { this.sdk?.firstFrameReady?.(); } catch(e){} },
-    gameReady(){ try { this.sdk?.gameReady?.(); } catch(e){} },
-    sendScore(score){ try { this.sdk?.sendScore?.({value:score}); } catch(e){} },
-    pauseHandlers(){
-      try { this.sdk?.onPause?.(()=> { document.body.classList.add('paused'); AUDIO.pause(); }); } catch(e){}
-      try { this.sdk?.onResume?.(()=> { document.body.classList.remove('paused'); AUDIO.resume(); }); } catch(e){}
+    sdk: window.ytgame || null,
+    inPlayables: Boolean(window.ytgame?.IN_PLAYABLES_ENV),
+    unsubs: [], ready:false,
+    firstFrameReady(){
+      try { this.sdk?.game?.firstFrameReady?.(); } catch(e) { this.logWarning(); }
+    },
+    gameReady(){
+      try { this.sdk?.game?.gameReady?.(); } catch(e) { this.logWarning(); }
+    },
+    logWarning(){ try { this.sdk?.health?.logWarning?.(); } catch(e){} },
+    async init(){
+      const sdk=this.sdk;
+      if(!sdk?.system || !sdk?.game) return;
+
+      // YouTube is the source of truth for platform mute state.
+      try { AUDIO.setPlatformAudio(Boolean(sdk.system.isAudioEnabled())); } catch(e) { this.logWarning(); }
+      try {
+        const off=sdk.system.onAudioEnabledChange((allowed)=>{ AUDIO.setPlatformAudio(Boolean(allowed)); if(this.ready) render(); });
+        if(typeof off==='function') this.unsubs.push(off);
+      } catch(e) { this.logWarning(); }
+
+      // Pause/resume is handled ONLY through the Playables SDK.
+      try {
+        const off=sdk.system.onPause(()=>{
+          document.body.classList.add('paused');
+          state.platformPaused=true;
+          AUDIO.pause();
+        });
+        if(typeof off==='function') this.unsubs.push(off);
+      } catch(e) { this.logWarning(); }
+      try {
+        const off=sdk.system.onResume(()=>{
+          state.platformPaused=false;
+          document.body.classList.remove('paused');
+          AUDIO.resume();
+        });
+        if(typeof off==='function') this.unsubs.push(off);
+      } catch(e) { this.logWarning(); }
+
+      // Use YouTube locale inside Playables. Local/Vercel fallback remains Traditional Chinese.
+      try {
+        const locale=await sdk.system.getLanguage();
+        if(typeof locale==='string') state.uiLang=locale.toLowerCase().startsWith('zh')?'zh':'en';
+      } catch(e) { this.logWarning(); }
+
+      // Chill Party is intentionally session-based, but loadData is awaited so a future
+      // persistent save can be added without risking save-before-load certification issues.
+      try { await sdk.game.loadData(); } catch(e) { /* Session play does not require cloud save. */ }
     }
   };
 
   const AUDIO = {
     ctx:null, master:null, bgmGain:null, sfxGain:null,
-    enabled:true, started:false, timer:null, step:0, nextTime:0,
+    musicEnabled:true, platformAllowed:true, started:false, timer:null, step:0, nextTime:0,
     init(){
       if(this.ctx) return true;
       const AC = window.AudioContext || window.webkitAudioContext;
@@ -25,19 +66,29 @@
       this.master = this.ctx.createGain();
       this.bgmGain = this.ctx.createGain();
       this.sfxGain = this.ctx.createGain();
-      this.master.gain.value = 0.72;
+      this.master.gain.value = this.platformAllowed ? 0.72 : 0.0001;
       this.bgmGain.gain.value = 0.51;
       this.sfxGain.gain.value = 0.55;
       this.bgmGain.connect(this.master); this.sfxGain.connect(this.master); this.master.connect(this.ctx.destination);
       return true;
     },
     async ensureStarted(){
-      if(!this.enabled || !this.init()) return;
+      if(!this.platformAllowed || !this.init()) return;
       try { if(this.ctx.state !== 'running') await this.ctx.resume(); } catch(e){}
-      if(!this.started){ this.started=true; this.startBgm(); }
+      if(!this.started){ this.started=true; if(this.musicEnabled) this.startBgm(); }
+    },
+    setPlatformAudio(allowed){
+      this.platformAllowed=Boolean(allowed);
+      if(!this.platformAllowed){
+        this.stopBgm();
+        if(this.master && this.ctx) this.master.gain.setTargetAtTime(0.0001,this.ctx.currentTime,.02);
+      } else {
+        if(this.master && this.ctx) this.master.gain.setTargetAtTime(.72,this.ctx.currentTime,.02);
+        if(this.started && this.musicEnabled) this.startBgm();
+      }
     },
     tone(freq=440,dur=.08,type='sine',gain=.12,when=0,target='sfx',detune=0){
-      if(!this.ctx || !this.enabled) return;
+      if(!this.ctx || !this.platformAllowed || state.platformPaused) return;
       const now=this.ctx.currentTime+when, osc=this.ctx.createOscillator(), g=this.ctx.createGain();
       osc.type=type; osc.frequency.setValueAtTime(freq,now); osc.detune.value=detune;
       g.gain.setValueAtTime(0.0001,now); g.gain.exponentialRampToValueAtTime(gain,now+.008); g.gain.exponentialRampToValueAtTime(0.0001,now+dur);
@@ -50,10 +101,10 @@
     reveal(){ this.tone(440,.08,'triangle',.09); this.tone(554,.08,'triangle',.09,.07); this.tone(659,.14,'triangle',.11,.14); },
     victory(){ [523,659,784,1047].forEach((f,i)=>this.tone(f,.24,'triangle',.12,i*.10)); },
     startBgm(){
-      if(!this.ctx || this.timer) return;
+      if(!this.ctx || this.timer || !this.musicEnabled || !this.platformAllowed || state.platformPaused) return;
       this.step=0; this.nextTime=this.ctx.currentTime+.05;
       const tick=()=>{
-        if(!this.enabled || !this.ctx){ this.stopBgm(); return; }
+        if(!this.musicEnabled || !this.platformAllowed || !this.ctx || state.platformPaused){ this.stopBgm(); return; }
         while(this.nextTime < this.ctx.currentTime+.35){ this.scheduleStep(this.step++,this.nextTime); this.nextTime += .25; }
       };
       tick(); this.timer=setInterval(tick,120);
@@ -68,27 +119,31 @@
       if(i%4===2) this.noiseHat(t,.018);
     },
     bgmTone(freq,t,dur,type,gain){
-      if(!this.ctx || !this.enabled) return;
+      if(!this.ctx || !this.platformAllowed || !this.musicEnabled || state.platformPaused) return;
       const osc=this.ctx.createOscillator(), g=this.ctx.createGain(); osc.type=type; osc.frequency.value=freq;
       g.gain.setValueAtTime(.0001,t); g.gain.exponentialRampToValueAtTime(gain,t+.01); g.gain.exponentialRampToValueAtTime(.0001,t+dur);
       osc.connect(g); g.connect(this.bgmGain); osc.start(t); osc.stop(t+dur+.03);
     },
     noiseHat(t,gain=.015){
-      if(!this.ctx || !this.enabled) return;
+      if(!this.ctx || !this.platformAllowed || !this.musicEnabled || state.platformPaused) return;
       const len=Math.max(1,Math.floor(this.ctx.sampleRate*.04)), b=this.ctx.createBuffer(1,len,this.ctx.sampleRate), d=b.getChannelData(0);
       for(let i=0;i<len;i++) d[i]=Math.random()*2-1;
       const src=this.ctx.createBufferSource(), hp=this.ctx.createBiquadFilter(), g=this.ctx.createGain(); src.buffer=b; hp.type='highpass'; hp.frequency.value=6000;
       g.gain.setValueAtTime(gain,t); g.gain.exponentialRampToValueAtTime(.0001,t+.04); src.connect(hp); hp.connect(g); g.connect(this.bgmGain); src.start(t); src.stop(t+.05);
     },
     stopBgm(){ if(this.timer){ clearInterval(this.timer); this.timer=null; } },
-    async toggle(){
-      this.enabled=!this.enabled;
-      if(this.enabled){ await this.ensureStarted(); this.startBgm(); if(this.master) this.master.gain.setTargetAtTime(.72,this.ctx.currentTime,.02); }
-      else { this.stopBgm(); if(this.master && this.ctx) this.master.gain.setTargetAtTime(.0001,this.ctx.currentTime,.02); }
+    async toggleMusic(){
+      this.musicEnabled=!this.musicEnabled;
+      if(this.musicEnabled){ await this.ensureStarted(); this.startBgm(); }
+      else this.stopBgm();
       render();
     },
-    pause(){ if(this.ctx?.state==='running') this.ctx.suspend().catch(()=>{}); },
-    resume(){ if(this.enabled && this.ctx?.state==='suspended') this.ctx.resume().catch(()=>{}); }
+    pause(){ this.stopBgm(); if(this.ctx?.state==='running') this.ctx.suspend().catch(()=>{}); },
+    resume(){
+      if(!this.platformAllowed) return;
+      if(this.ctx?.state==='suspended') this.ctx.resume().then(()=>{ if(this.musicEnabled && this.started) this.startBgm(); }).catch(()=>{});
+      else if(this.musicEnabled && this.started) this.startBgm();
+    }
   };
 
   const I18N = {
@@ -102,7 +157,7 @@
     scores:[], answers:{}, used:{draw:[],quiz:[],match:[]}, currentQuestion:null,
     phase:null, mixPlan:['draw','quiz','match'],
     roundSettings:{draw:4,quiz:3,match:3,mix:6},
-    awarded:new Set(), history:[], drawWordHidden:false, _showLangHint:true
+    awarded:new Set(), history:[], drawWordHidden:false, _showLangHint:true, platformPaused:false
   };
 
   function t(k){ return I18N[state.uiLang][k] || k; }
@@ -124,7 +179,7 @@
   function playerLabel(i,lang=state.uiLang){ return lang==='zh'?`玩家 ${i+1}`:`Player ${i+1}`; }
   function header(){
     const homeButton = state.screen==='home' ? '' : `<button class="pill home-pill" data-global-home aria-label="${t('home')}">⌂ ${t('home')}</button>`;
-    return `<div class="topbar"><div class="brand">CHILL PARTY<small>V0.2.4 · HIDE WORD · BGM 150%</small></div><div class="top-actions">${homeButton}<button class="pill" data-audio-toggle aria-label="${AUDIO.enabled?'Sound on':'Sound off'}">${AUDIO.enabled?'🔊':'🔇'}</button><div class="lang-hint-wrap"><button class="pill" data-ui-lang>${state.uiLang==='en'?'中文':'EN'}</button>${state.screen==='home'&&state._showLangHint!==false?'<div class="lang-hint" data-lang-hint>可更換語言<br><span>Change Language</span></div>':''}</div></div></div>`;
+    return `<div class="topbar"><div class="brand">CHILL PARTY<small>V0.3.0 · YOUTUBE PLAYABLES</small></div><div class="top-actions">${homeButton}<button class="pill" data-audio-toggle aria-label="${AUDIO.musicEnabled?'Background music on':'Background music off'}" title="BGM">${AUDIO.musicEnabled?'🎵':'🎶'}</button><div class="lang-hint-wrap"><button class="pill" data-ui-lang>${state.uiLang==='en'?'中文':'EN'}</button>${state.screen==='home'&&state._showLangHint!==false?'<div class="lang-hint" data-lang-hint>可更換語言<br><span>Change Language</span></div>':''}</div></div></div>`;
   }
   function modeLabel(m,lang=state.uiLang){ const map={draw:lang==='zh'?'你畫我猜':'Draw & Guess',quiz:lang==='zh'?'知識快問快答':'Quick Quiz',match:lang==='zh'?'默契挑戰':'Match Me',mix:lang==='zh'?'混合 Party':'Mix Party'};return map[m]; }
   function scores(){return `<div class="score-strip">${state.players.map((p,i)=>`<div class="score-chip ${i===state.currentPlayer?'active':''}">${playerLabel(i)} · ${state.scores[i]}</div>`).join('')}</div>`}
@@ -166,7 +221,7 @@
   function setRounds(n){ n=parseInt(n,10); if(!Number.isFinite(n)) n=1; n=Math.max(1,Math.min(100,n)); state.roundSettings[state.mode]=n; render(); }
   function startGame(){ state._victoryPlayed=false; state.round=0;state.scores=Array(state.playerCount).fill(0);state.used={draw:[],quiz:[],match:[]};state.history=[];state.totalRounds=state.roundSettings[state.mode]||1;nextRound(); }
   function nextRound(){
-    if(state.round>=state.totalRounds){state.screen='results';YT.sendScore(Math.max(...state.scores));return render();}
+    if(state.round>=state.totalRounds){state.screen='results';return render();}
     const m=state.mode==='mix'?state.mixPlan[state.round%state.mixPlan.length]:state.mode; state.phase=m; state.answers={};state.awarded=new Set();state.drawWordHidden=false;
     state.currentPlayer = m==='draw'?state.round%state.playerCount:0; state.currentQuestion=randQuestion(m); state.screen='pass';render();
   }
@@ -230,7 +285,7 @@
     const h=document.querySelector('[data-global-home]');
     if(h)h.onclick=goHome;
     const a=document.querySelector('[data-audio-toggle]');
-    if(a)a.onclick=(e)=>{e.stopPropagation();AUDIO.toggle();};
+    if(a)a.onclick=(e)=>{e.stopPropagation();AUDIO.toggleMusic();};
   }
 
   function setupCanvas(){
@@ -245,11 +300,14 @@
   }
 
 
-  document.addEventListener('pointerdown',()=>AUDIO.ensureStarted(),{once:true,capture:true});
-  document.addEventListener('click',e=>{const b=e.target.closest?.('button');if(b && !b.disabled && !b.matches('[data-audio-toggle]')) AUDIO.click();},true);
-  document.addEventListener('visibilitychange',()=>{ if(document.hidden) AUDIO.pause(); else AUDIO.resume(); });
+  document.addEventListener('pointerdown',()=>{if(!state.platformPaused)AUDIO.ensureStarted();},{capture:true});
+  document.addEventListener('click',e=>{if(state.platformPaused)return;const b=e.target.closest?.('button');if(b && !b.disabled && !b.matches('[data-audio-toggle]')) AUDIO.click();},true);
 
   window.addEventListener('resize',()=>{/* DOM/CSS is responsive; state intentionally preserved */});
   document.addEventListener('keydown',e=>{if(e.key==='Escape'){/* Do not preventDefault per Playables requirement. */}});
-  YT.firstFrameReady(); render(); setTimeout(()=>{ if(state._showLangHint){ state._showLangHint=false; const h=document.querySelector('[data-lang-hint]'); if(h) h.classList.add('hide'); } },5500); YT.pauseHandlers(); requestAnimationFrame(()=>YT.gameReady());
+  YT.firstFrameReady();
+  await YT.init();
+  render();
+  setTimeout(()=>{ if(state._showLangHint && !state.platformPaused){ state._showLangHint=false; const h=document.querySelector('[data-lang-hint]'); if(h) h.classList.add('hide'); } },5500);
+  requestAnimationFrame(()=>{ YT.ready=true; YT.gameReady(); });
 })();
